@@ -1,0 +1,493 @@
+# Glasses - YOLO26 Depth Android MVP
+
+这是一个纯原生 Android Kotlin 项目。它默认通过局域网 WebRTC 接收 BOLON/Rokid
+眼镜的第一视角视频，也保留 CameraX 手机后置摄像头作为本地测试输入。手机端通过
+LiteRT 运行 `yolo26n-depth_w8a32.tflite`，在内存中保留原始米制深度数组，并使用
+Jetpack Compose 显示深度、障碍分类和音频状态。
+
+当前版本是后续开发的可运行基线，重点验证完整链路：
+
+```text
+眼镜 CameraX -> WebRTC -> I420 Bitmap --+
+手机 CameraX -> RGBA Bitmap ------------+-> 模型输入预处理 -> LiteRT GPU/CPU 推理
+       -> MetricDepthFrame(FloatArray, meters)
+       -> 深度范围 Mask + 可选 MLE 地面减除 + 2/3 帧稳定
+       -> 64x64 occupancy/距离 -> HRTF 双耳连续声景 -> AudioTrack
+       -> 可选深度/分类 Bitmap -> Compose 屏幕
+```
+
+当前 MVP 已在 HONOR REP-AN00（Android 15）完成真机验证。GPU 推理、权限恢复、
+前后台切换、锁屏恢复和屏幕旋转均已跑通。详细结果见
+[MVP_VERIFICATION.md](MVP_VERIFICATION.md)。
+
+## 当前功能
+
+- 默认监听 TCP 8888 信令并接收眼镜 WebRTC 视频轨道。
+- 将 WebRTC I420 帧转换为方向正确的 Android `Bitmap`。
+- 保留 CameraX 手机后置摄像头作为可切换的本地测试输入。
+- 提供自定义 BLE 热点参数发送入口，供眼镜尚未保存热点时使用。
+- 只分析最新帧，避免推理速度低于摄像头帧率时形成任务堆积。
+- 将相机 RGBA 帧转换为方向正确的 Android `Bitmap`。
+- 从 APK assets 加载本地 TFLite 模型，不依赖网络下载。
+- LiteRT 优先使用 GPU；GPU 初始化失败时自动回退到 CPU。
+- 支持识别 NCHW/NHWC RGB 输入布局。
+- 将单通道米制深度张量作为正式推理结果保留在内存中。
+- 使用 C++/NDK 生成基础深度范围 Mask，MLE 成功时减去地面，失败时保守回退基础 Mask。
+- 障碍物在 `3.0 m` 内进入关注范围，已进入目标超过 `3.3 m` 后退出。
+- 普通障碍物使用最近三帧中的两帧多数判定；`0.8 m` 内障碍物立即进入现有连续声景。
+- 画面和声音统一使用稳定后的障碍物 Mask；占用强度和代表距离继续在内存中平滑。
+- 使用 64x64 HRTF 数据生成连续声景，越近的障碍物声音越强，并通过 `AudioTrack` 播放。
+- 基于“新障碍物出现”的即时滴声当前保持停用，等待后续按危险距离重新定义。
+- 可选择是否把深度张量映射为伪彩色图；颜色映射不会修改原始深度。
+- 可切换障碍物分类显示；MLE 可靠时显示范围内非地面障碍物，MLE 失败时显示稳定后的
+  基础深度范围结果，其余显示为黑色。
+- 记录每帧有限正值比例、最小值、最大值以及近似 P10/P50/P90。
+- 屏幕显示实际加速器、FPS、单次模型推理时间和当前深度范围。
+- 仅在选择手机摄像头时请求相机权限，并支持从系统设置返回后恢复。
+- 包含纯 JVM 测试和需要真机运行的 Android instrumentation 测试。
+
+当前版本不包含原始摄像头预览、目标检测框、录像、独立测距传感器、NPU 或网络模型下载。
+
+## 技术基线
+
+| 项目 | 当前配置 |
+|---|---|
+| 语言 | Kotlin 2.2.10 |
+| UI | Jetpack Compose + Material 3 |
+| 相机 | CameraX 1.6.0 |
+| 视频传输 | WebRTC Android 144.7559.14 + TCP 8888 信令 |
+| 推理 | LiteRT 2.1.5 `CompiledModel` |
+| Android Gradle Plugin | 9.3.2 |
+| Gradle | 9.5.0 |
+| Java | 17 |
+| NDK | `30.0.16138531` (`r30-beta3`) |
+| CMake | 3.22.1 |
+| Native ABI | `arm64-v8a` |
+| `minSdk` | 26 |
+| `targetSdk` / `compileSdk` | 37 |
+| 应用 ID | `com.example.glasses` |
+| 模型 | `yolo26n-depth_w8a32.tflite`，约 5.2 MiB |
+| 当前模型输入/输出 | RGB `640x640` / depth `640x640` |
+
+## 代码架构
+
+项目按职责分为 UI、相机、推理、地面过滤、障碍网格和音频处理。依赖方向保持从上层
+业务编排指向下层实现，不让 Compose 页面直接操作张量、LiteRT 或 native 工作缓冲区。
+
+```mermaid
+flowchart TD
+    A[MainActivity] --> B[DepthCameraScreen]
+    B --> C[DepthCameraController]
+    B --> Q[LocalSignalingServer]
+    Q --> R[WebRTC VideoTrack]
+    R --> S[WebRtcBitmapSink]
+    B --> D[DepthCameraViewModel]
+    C --> E[ImageProxyBitmapConverter]
+    E -->|upright Bitmap| D
+    S -->|upright Bitmap| D
+    D --> F[DepthEstimator]
+    F --> G[LiteRtDepthModel]
+    G --> H[LiteRT GPU]
+    G -. GPU 失败 .-> I[LiteRT CPU]
+    F --> J[MetricDepthFrame]
+    J --> K[Native MLE Ground Filter]
+    K --> L[64x64 Obstacle Occupancy]
+    L --> M[DepthAudioCoordinator]
+    M --> N[HRTF Audio Engine]
+    N --> O[AudioTrack]
+    F -. UI 请求时 .-> P[Depth or Classification Bitmap]
+    J -->|DepthFrame| D
+    P -->|optional Bitmap| D
+    D -->|StateFlow| B
+```
+
+### 运行时数据流
+
+1. `MainActivity` 创建 Compose 页面。
+2. `DepthCameraScreen` 初始化模型，并根据设置选择眼镜 WebRTC 或手机 CameraX 输入。
+3. 眼镜模式在页面处于前台时监听 TCP 8888，完成 SDP/ICE 交换并订阅远程视频轨道；
+   手机模式在权限已授予后启动 `DepthCameraController`。
+4. WebRTC 输入按 latest-only 方式将 I420 转为直立 Bitmap；CameraX 输入输出
+   `RGBA_8888 ImageProxy`，并使用
+   `STRATEGY_KEEP_ONLY_LATEST` 保留最新帧。
+5. `WebRtcBitmapSink` 或 `ImageProxyBitmapConverter` 返回直立 Bitmap。
+6. `DepthCameraViewModel` 使用 `AtomicBoolean` 保证同一时刻只处理一帧；繁忙时
+   新到达的 Bitmap 会被释放。
+7. `DepthEstimator` 将画面缩放到模型尺寸、归一化 RGB 到 `[0, 1]`，然后调用
+   `LiteRtDepthModel`。
+8. 模型输出的 Float 深度数组不做单位换算，直接封装为米制 `MetricDepthFrame`。
+9. Native MLE 使用下方 ROI 以 8 像素步长拟合地面，每两帧执行一次完整拟合，中间帧
+   只复用最近一次通过质量检查的平面。拟合成功时使用 Ground-aware 分类滤除地面；拟合
+   失败或画面没有地面时立即切换到 Depth-only，仍输出 `3.0 m` 内有效深度。Native 同时
+   生成 64x64 occupancy 和近端百分位代表距离，距离退出阈值为 `3.3 m`；只有分类显示
+   开启时才额外写入 classMap。
+10. `DepthAudioCoordinator` 消费最新 occupancy 和距离网格，执行平滑与占用迟滞。Depth-only
+    声源需要连续稳定三帧，并最多保留左、中、右三个最近点，再由 HRTF 引擎生成距离相关
+    的双声道连续声景并交给 `AudioTrack`。
+11. UI 按需生成 256x256 深度伪彩色预览或固定四色分类 Bitmap，Bitmap 最多约 4 FPS
+    刷新且不参与声音输入；模型、MLE、occupancy 和声音链路仍按完整深度帧运行。
+12. ViewModel 发布 `DepthCameraUiState.Running`，Compose 刷新画面和性能指标。
+
+## 目录与文件职责
+
+```text
+glasses/
+|-- app/
+|   |-- build.gradle.kts
+|   `-- src/
+|       |-- main/
+|       |   |-- AndroidManifest.xml
+|       |   |-- assets/
+|       |   |   |-- yolo26n-depth_w8a32.tflite
+|       |   |   |-- hrtf_grid64.bin
+|       |   |   `-- hrtf_grid64_meta.json
+|       |   |-- cpp/
+|       |   |   |-- CMakeLists.txt
+|       |   |   |-- ground_filter.cpp
+|       |   |   `-- ground_filter_jni.cpp
+|       |   `-- java/com/example/glasses/
+|       |       |-- MainActivity.kt
+|       |       |-- audio/
+|       |       |-- camera/
+|       |       |-- depth/
+|       |       |-- ground/
+|       |       |-- inference/
+|       |       |-- obstacle/
+|       |       |-- pipeline/
+|       |       `-- ui/
+|       |-- test/          # 不依赖 Android 设备的 JVM 测试
+|       `-- androidTest/   # 需要模拟器或真机的测试
+|-- gradle/libs.versions.toml
+|-- MVP_VERIFICATION.md
+`-- README.md
+```
+
+### 应用入口与 UI
+
+| 文件 | 职责 |
+|---|---|
+| `MainActivity.kt` | 应用入口，挂载主题和 `DepthCameraScreen`。 |
+| `ui/DepthCameraScreen.kt` | 相机权限、生命周期观察、Controller 启停和页面渲染。 |
+| `ui/DepthCameraUiState.kt` | 定义 `LoadingModel`、`WaitingForCamera`、`Running`、`Error` 状态。 |
+| `ui/DepthCameraViewModel.kt` | 初始化模型、串行处理帧、计算平滑 FPS，并通过 `StateFlow` 发布结果。 |
+| `ui/theme/*` | Compose 主题、颜色和字体配置。 |
+
+`DepthCameraScreen` 在 Activity 每次 `ON_RESUME` 时重新读取 CAMERA 权限。这一逻辑
+不能删除，否则用户从系统设置授权后返回时，页面可能仍停留在未授权状态。
+
+### CameraX 层
+
+| 文件 | 职责 |
+|---|---|
+| `camera/DepthCameraController.kt` | 绑定后置相机、创建单线程 analyzer、实施最新帧背压并管理 CameraX 生命周期。 |
+| `camera/ImageProxyBitmapConverter.kt` | 将 `RGBA_8888 ImageProxy` 转成直立 ARGB Bitmap。 |
+| `webrtc/LocalSignalingServer.java` | 监听 TCP 8888，完成局域网 SDP/ICE 交换并订阅眼镜视频轨道。 |
+| `webrtc/WebRtcBitmapSink.kt` | latest-only 将远程 I420 帧转换为直立 ARGB Bitmap。 |
+| `ble/BleProvisioningClient.kt` | 扫描自定义眼镜 GATT 服务并写入一次性热点参数。 |
+
+相机层必须保持以下资源规则：
+
+- 每个 `ImageProxy` 都必须在 `finally` 中调用 `close()`。
+- `stop()` 负责清除 analyzer 和解绑 CameraX use case。
+- `close()` 还要关闭 analyzer 线程。
+- CameraX 的绑定和解绑最终在主线程执行。
+- `startGeneration` 用于忽略已经过期的异步启动回调，避免快速前后台切换时重复绑定。
+
+### 深度处理层
+
+| 文件 | 职责 |
+|---|---|
+| `depth/DepthEstimator.kt` | 缩放 Bitmap、RGB 归一化、调用模型、米制统计、可选颜色映射和耗时统计。 |
+| `depth/MetricDepthFrame.kt` | 行优先米制深度数组、尺寸和单调时间戳的数据契约。 |
+| `depth/DepthFrame.kt` | 一帧推理结果，包括正式米制深度、可选 Bitmap、统计量和各阶段耗时。 |
+| `depth/DepthColorizer.kt` | 忽略非有限值，计算当前帧范围并映射到 256 色调色板。 |
+| `depth/DepthTensorShape.kt` | 校验 LiteRT 输出形状，支持常见 NCHW、NHWC 和二维单通道布局。 |
+
+`DepthEstimator` 会复用模型输入 Bitmap、输入像素数组、Float 输入数组、百分位采样数组，
+以及按需创建的输出像素数组。关闭可视化时不会创建深度 Bitmap；UI 开启可视化时每帧
+仍会创建新的 Bitmap，后续做内存和帧率优化时这里仍是重要入口。
+
+### Native 地面过滤层
+
+| 文件 | 职责 |
+|---|---|
+| `ground/NativeGroundFilter.kt` | 管理 native handle，校验调用方缓冲区并提供可重复安全关闭的 JNI wrapper。 |
+| `ground/GroundFilterConfig.kt` | 定义拟合 ROI、全画面分类 ROI、距离和迭代配置。 |
+| `ground/GroundClassificationRenderer.kt` | 按需把 classMap 映射为固定四色 ARGB Bitmap。 |
+| `cpp/ground_filter.cpp` | 实现 MLE/RANSAC 地面拟合、距离迟滞、连通地面保留及 occupancy/距离映射。 |
+| `cpp/ground_filter_jni.cpp` | 实现 native 生命周期，并填充预分配 occupancy、距离、可选 classMap 和指标缓冲区。 |
+| `cpp/CMakeLists.txt` | 使用 C++17 构建 `libground_filter.so`。 |
+
+地面拟合使用画面下方 55%，分类覆盖完整画面；两者的 ROI 相互独立。拟合可使用最远
+`30.0 m` 的有效深度。基础 Mask 先按 `3.0/3.3 m` 距离迟滞生成；MLE 可靠时只从中减去
+地面，MLE 失败时保留基础 Mask。普通像素使用 2/3 帧多数判定，`0.8 m` 内障碍物绕过
+等待。分类显示关闭时，native 仍使用同一稳定 Mask 计算 occupancy、代表距离和统计值，
+但不写完整 classMap。拟合失败不再被视为整条链路不可用，也不会标记为安全。
+
+### 障碍物与音频层
+
+| 文件 | 职责 |
+|---|---|
+| `obstacle/ObstacleGridProcessor.kt` | latest-only 消费统一 Mask 生成的 occupancy/距离，执行强度平滑、退出迟滞和紧急距离直通。 |
+| `obstacle/ImmediateObstacleAlertDetector.kt` | 保留的旧新障碍检测器；当前不接入运行时播放。 |
+| `pipeline/DepthAudioCoordinator.kt` | 协调视觉帧、连续声景、超时和生命周期。 |
+| `audio/Glasses64AudioEngine.kt` | 根据 64x64 HRTF 网格和代表距离生成双声道连续声景。 |
+| `audio/Hrtf64Repository.kt` | 校验并加载只读 HRTF BIN/JSON 资产。 |
+
+### LiteRT 推理层
+
+| 文件 | 职责 |
+|---|---|
+| `inference/ModelFileProvider.kt` | 将 APK asset 按文件大小校验并复制到应用私有 `files/models` 目录。 |
+| `inference/LiteRtDepthModel.kt` | 创建 LiteRT 模型、GPU/CPU 选择、张量缓冲、输入输出形状解析和资源释放。 |
+
+模型先被复制到应用私有目录，是因为当前 LiteRT 接口使用实际文件路径创建
+`CompiledModel`。GPU 模式启用了 program cache，缓存目录为应用的 `codeCacheDir`。
+
+GPU 初始化、预热或张量解析失败时，`LiteRtDepthModel` 会释放已经创建的资源，然后
+使用 CPU 重新创建模型。CPU 线程数限制在 1 到 4 之间。UI 显示的是实际创建成功的
+加速器，而不是配置中的期望值。
+
+当前代码会尝试通过常见张量名称读取形状；无法读取元数据时，会根据元素数量推断
+方形 RGB 输入或方形单通道输出。更换模型后必须重新运行真机测试，不能假设新模型
+仍满足这个回退条件。
+
+## 状态、线程和资源所有权
+
+| 对象 | 创建位置 | 执行线程 | 释放位置 |
+|---|---|---|---|
+| `DepthCameraController` | Compose `remember` | CameraX 主线程绑定 + 单线程 analyzer | `DepthCameraScreen` 的 `DisposableEffect` |
+| `LocalSignalingServer` | 前台输入会话 | WebRTC native 线程 + TCP 服务线程 | 页面停止或切换输入时 `stop()` |
+| `WebRtcBitmapSink` | Compose `remember` | 单线程 I420 转换 executor | `DepthCameraScreen` 的 `DisposableEffect` |
+| 原始相机 Bitmap | `ImageProxyBitmapConverter` | analyzer 线程 | `DepthCameraViewModel.process()` 的 `finally` |
+| `DepthEstimator` | `DepthCameraViewModel.initialize()` | `Dispatchers.Default` | ViewModel `onCleared()` |
+| `LiteRtDepthModel` 和 TensorBuffer | `DepthEstimator` | `Dispatchers.Default` | `DepthEstimator.close()` |
+| `NativeGroundFilter` context | `DepthEstimator` | 单一推理处理线程 | `DepthEstimator.close()`，重复关闭安全 |
+| `DepthAudioCoordinator` / AudioTrack | `DepthCameraViewModel` | 独立协调与音频线程 | 生命周期停止或 ViewModel `onCleared()` |
+| 原始米制深度数组 | `LiteRtDepthModel.run()` | `Dispatchers.Default` | 随 `MetricDepthFrame` 传给后续处理，最终由 GC 回收 |
+| 可选输出深度 Bitmap | `DepthEstimator.predict()` | `Dispatchers.Default` | 交给 Compose 状态显示，未发布结果会立即 recycle |
+
+不要在主线程运行模型推理。添加新处理步骤时，也应放在 ViewModel 的后台调度链路中，
+并继续保证同一模型实例不会被并发调用。
+
+## 本地构建与运行
+
+### 环境要求
+
+- Android Studio，使用内置 JBR 17 或其他 Java 17。
+- Android SDK 37。
+- NDK `30.0.16138531` 和 CMake 3.22.1。
+- Android 8.0（API 26）或更高版本的模拟器/真机。
+- 当前 native 库只构建 `arm64-v8a`，真机必须支持 64 位 ARM 应用。
+- 真机运行需要开启开发者选项和 USB 调试。
+
+项目的依赖仓库优先使用阿里云 Google/Public 镜像，然后回退到 `google()` 和
+`mavenCentral()`。
+
+### 从 GitHub 获取项目
+
+```powershell
+git clone https://github.com/xcwu666-maker/glasses.git
+cd glasses
+```
+
+首次打开时，在 Android Studio 的 SDK Manager 中安装 Android SDK 37、NDK
+`30.0.16138531` 和 CMake 3.22.1，然后等待 Gradle Sync 完成。Android Studio 会根据
+队友自己的 SDK 目录生成 `local.properties`；不要复制或提交其他电脑的该文件。
+
+模型 `yolo26n-depth_w8a32.tflite` 和运行声音所需的 HRTF 资源已经包含在仓库中，clone
+后不需要再从你的电脑手动复制 assets。
+
+### Android Studio 运行
+
+1. 使用 Android Studio 打开项目根目录。
+2. 等待 Gradle Sync 完成。
+3. 连接并选择 Android 手机。
+4. 选择 `app` 运行配置。
+5. 点击绿色 Run 按钮。
+6. 在手机上允许 USB 安装和相机权限。
+
+安装成功后，正常顺序为：加载模型、启动摄像头、显示实时深度图。
+
+### PowerShell 构建
+
+如果当前终端没有正确选择 Java，可临时设置 Android Studio 内置 JBR：
+
+```powershell
+$env:JAVA_HOME = 'D:\Android\Android Studio\jbr'
+$env:Path = "$env:JAVA_HOME\bin;$env:Path"
+```
+
+运行 JVM 测试并构建 Debug APK：
+
+```powershell
+.\gradlew.bat testDebugUnitTest assembleDebug
+```
+
+安装到已连接手机：
+
+```powershell
+.\gradlew.bat installDebug
+```
+
+APK 输出位置：
+
+```text
+app/build/outputs/apk/debug/app-debug.apk
+```
+
+## 测试
+
+### JVM 测试
+
+`app/src/test` 当前覆盖：
+
+- 深度张量形状解析和非法形状拒绝。
+- 米制数据契约、伪彩色输出、非有限值、平坦深度图、数组大小及原始数组不被修改。
+- 地面过滤配置、障碍物分类显示、占用/距离网格及平滑迟滞。
+- HRTF 映射、音频生成和视觉到声音协调器的 latest-only/生命周期行为。
+
+运行：
+
+```powershell
+.\gradlew.bat testDebugUnitTest
+```
+
+### 真机测试
+
+`app/src/androidTest` 当前覆盖：
+
+- Android 应用上下文基础检查。
+- 模型从 assets 加载并完成一次 GPU/CPU 推理。
+- Bitmap 完整转换为 `DepthFrame`，并校验输出和耗时数据。
+- 关闭 Bitmap 渲染后仍输出 `640x640` 米制深度，且至少 `99.9%` 为有限正值。
+- native create/process/reset/destroy 连续执行 100 次，验证重复关闭和预分配缓冲区写入。
+- Python 金标与 C++ 地面拟合、全画面分类和 occupancy 输出的一致性。
+- 深度进入/退出迟滞、距离网格输出和合成 occupancy 实际触发 HRTF 连续声景。
+- 真实 Activity 前后台、横竖屏重建后恢复实时 GPU 深度页面。
+- 真实 AudioTrack 停止后释放轨道并清空工作线程引用。
+
+运行：
+
+```powershell
+.\gradlew.bat assembleDebugAndroidTest connectedDebugAndroidTest
+```
+
+instrumentation 测试会安装两个 APK：应用 APK 和测试 APK。测试完成后，测试框架可能
+自动卸载临时包，这是正常行为。只想让应用保留在手机上时，请运行 `installDebug` 或
+使用 Android Studio 的绿色 Run 按钮。
+
+## 日志与排查
+
+在 Android Studio Logcat 中选择目标手机和 `com.example.glasses` 进程，然后使用：
+
+```text
+tag:LiteRtDepthModel
+```
+
+GPU 成功时可看到：
+
+```text
+LiteRT accelerator=GPU input=640x640 output=DepthTensorShape(width=640, height=640)
+```
+
+GPU 失败时会先记录回退原因，随后显示 `accelerator=CPU`。屏幕上的 GPU/CPU 标签必须
+与该日志一致。
+
+常见问题：
+
+| 现象 | 优先检查 |
+|---|---|
+| Android Studio 找不到手机 | `adb devices`、USB 调试授权、手机的 USB 用途和厂商 USB 安装开关。 |
+| `INSTALL_FAILED_ABORTED` | 保持手机解锁，并允许“通过 USB 安装”或安装确认弹窗。 |
+| 页面一直提示权限 | 系统设置中的相机权限；返回页面后应由 `ON_RESUME` 自动刷新。 |
+| 显示 CPU | 查看 `LiteRtDepthModel` 的 GPU 初始化异常，确认设备和模型是否支持 GPU。 |
+| 深度图方向错误 | 检查 `ImageProxy.imageInfo.rotationDegrees` 和 Bitmap 转换逻辑。 |
+| 图像卡住或延迟不断增加 | 确认仍使用 `KEEP_ONLY_LATEST`，且每个 `ImageProxy` 都被关闭。 |
+| 模型加载失败 | 检查 asset 文件名、文件大小、输入输出张量类型和形状。 |
+
+## 更换或新增模型
+
+当前模型契约是“Float RGB 输入、Float 单通道深度输出”。替换模型时按以下顺序操作：
+
+1. 将 `.tflite` 文件放入 `app/src/main/assets/`。
+2. 更新 `DepthCameraViewModel.MODEL_ASSET`。
+3. 确认 `app/build.gradle.kts` 中仍有 `noCompress += "tflite"`。
+4. 确认模型输入是 NCHW 或 NHWC RGB，并核对是否需要 `[0, 1]` 之外的归一化。
+5. 确认输出是单通道深度图；多输出或多通道模型需要修改 `LiteRtDepthModel`。
+6. 如果输入/输出是 INT8、UINT8 或其他量化类型，需要新增量化与反量化处理；当前实现
+   直接读写 `FloatArray`。
+7. 更新或新增 `LiteRtDepthModelTest` 和 `DepthEstimatorTest`。
+8. 在真机 Logcat 中确认实际加速器、输入输出尺寸和有限输出值。
+9. 重新完成至少五分钟稳定性、前后台、旋转和权限恢复测试。
+
+不要仅通过修改文件名替换模型。预处理、张量布局和输出语义必须同时匹配。
+
+## 已知限制
+
+- 当前 Ultralytics depth 权重包含训练后的米制 log-affine 校准，LiteRT 输出与原始
+  PyTorch 权重的校准后输出已经完成数值对照。它仍属于单目模型估计值，不能替代
+  测距传感器；正式安全功能必须继续验证不同场景、设备和距离下的绝对误差。
+- 每帧按自身最小值和最大值做颜色归一化，跨帧颜色不代表固定的绝对深度尺度，画面
+  也可能随范围变化产生颜色波动。
+- 相机画面当前直接拉伸到模型输入尺寸，没有 letterbox；非正方形画面会发生比例形变。
+- 当前只读取第一个输入和第一个输出 TensorBuffer。
+- 张量名称匹配和方形形状推断是兼容性回退，不是通用模型解析器。
+- 开启可视化时仍会周期性创建输出 Bitmap；深度预览已限制为 256x256 和约 4 FPS，
+  但 CameraX RGBA Bitmap 仍会造成周期性内存高水位和 GC。
+- 当前 Android Release 构建仍关闭了 R8 optimization，尚未配置正式签名和发布流程；
+  native ground filter 已显式使用 `-O3`。
+- 当前 native 工具链使用已安装的 NDK `r30-beta3`；正式发布前应升级到当时的稳定版并
+  重新完成 native parity、性能和生命周期测试。
+- 完整地面拟合每两帧执行一次，中间帧最多复用一帧最近可靠平面；完整拟合失败时立即
+  停止复用并切换到基础深度 Mask。2/3 帧多数判定会抑制单帧模式切换，但持续失败时
+  仍会保守显示并播放范围内区域。
+- MVP 不显示原始摄像头画面，也没有 CameraX `Preview` use case。
+- HONOR REP-AN00 热态五分钟测试的最后三分钟为 `10.972 FPS`；GPU 推理平均
+  `36.055 ms`，MLE 平均 `13.649 ms`、P95 `28.502 ms`。持续 10 FPS 和 MLE 平均值
+  已达标，但 MLE P95 仍高于 25 ms 的最终验收目标，后续应优先分析热降频、HRTF CPU
+  竞争和 ARM 向量化，不应继续通过降低拟合采样精度换取速度。
+
+## 后续开发建议
+
+建议按以下优先级推进，避免同时扩大模型、相机和 UI 三个方向的改动范围：
+
+1. 将 MLE P95 从 `28.502 ms` 降到 `<=25 ms`，优先分析 HRTF 线程竞争和 ARM 向量化，
+   不再扩大拟合步长或减少 RANSAC 迭代数。
+2. 继续降低 CameraX RGBA Bitmap 带来的周期性 PSS/GC 高水位，并评估直接处理 YUV。
+3. 明确是否需要保持画面比例；如需要，为输入增加 letterbox，并对输出做逆变换。
+4. 为伪彩色范围增加时间平滑或固定范围，减少跨帧颜色闪烁。
+5. 如果要同时显示原图和深度图，再引入 CameraX `Preview`，不要复用深度输出 Bitmap
+   作为原始预览。
+6. 如果要把深度用于安全距离判断，需要用已知距离目标验证模型绝对误差，并评估相机
+   内参、画面拉伸和设备差异；不能只凭单帧 `minDepth`/`maxDepth` 完成验收。
+7. 为不同模型建立独立配置或接口，避免在 UI 和 ViewModel 中堆叠模型特例。
+8. 正式发布前补齐签名、Release 优化、设备兼容矩阵、隐私说明和许可证文件。
+
+## 开发约定
+
+- UI 状态变更通过 `DepthCameraUiState` 和 ViewModel 发布，不在 CameraX analyzer 中
+  直接修改 Compose UI。
+- 相机格式转换只放在 `camera` 包。
+- 模型张量和 LiteRT API 只放在 `inference` 包。
+- 与具体深度模型相关的预处理、后处理和结果类型放在 `depth` 包。
+- 任何可能阻塞的模型或图像处理都不能放在主线程。
+- 新增资源后要明确所有权和释放位置，特别是 `ImageProxy`、Bitmap、Executor、
+  TensorBuffer 和 CompiledModel。
+- 修改模型契约、帧格式、线程模型或生命周期行为时必须增加对应测试。
+- 不要提交 `local.properties`、构建产物或 Android Studio 用户态 `.idea` 文件。
+
+## 来源与许可证注意事项
+
+`LiteRtDepthModel.kt` 的 LiteRT 包装逻辑参考并派生自 Ultralytics
+`yolo-flutter-app` 中的 `LiteRtModel.kt`，源项目采用 AGPL-3.0。文件中保留了来源说明。
+
+当前仓库根目录尚未包含独立的 `LICENSE` 或 `NOTICE` 文件。在公开分发、提供网络服务
+或商业使用前，需要确认以下内容：
+
+- Ultralytics 参考代码的 AGPL-3.0 合规要求。
+- YOLO26 depth 模型文件本身的许可证和分发权限。
+- 第三方 Android、CameraX、Compose 和 LiteRT 依赖的许可证声明。
+- 是否需要公开对应源代码、修改说明和完整许可证文本。
+
+许可证问题应在正式发布前解决，不能只依赖源码文件中的一行注释。

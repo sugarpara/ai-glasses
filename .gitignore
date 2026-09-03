@@ -1,0 +1,23 @@
+# Gradle 缓存
+.gradle/
+.gradle-codex/
+build/
+.cache/
+.codex/
+
+# Android 相关
+*.iml
+*.lock
+local.properties
+.idea/
+.cxx/
+captures/
+
+# 编译产物
+*.class
+*.apk
+*.dex
+
+# 系统文件
+.DS_Store
+Thumbs.db
