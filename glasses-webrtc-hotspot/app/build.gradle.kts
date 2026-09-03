@@ -13,8 +13,8 @@ android {
         applicationId = "com.example.glasses"
         minSdk = 26
         targetSdk = 37
-        versionCode = 27
-        versionName = "1.26-raw-depth-classification-preview"
+        versionCode = 29
+        versionName = "1.28-flexible-video-panels"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

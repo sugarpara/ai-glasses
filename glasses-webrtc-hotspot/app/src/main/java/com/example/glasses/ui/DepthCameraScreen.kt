@@ -28,11 +28,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -46,6 +48,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -122,6 +125,9 @@ internal fun DepthCameraScreen(
     val signalingServerRef = remember { AtomicReference<LocalSignalingServer?>(null) }
     var activeSignalingServer by remember { mutableStateOf<LocalSignalingServer?>(null) }
     var remoteVideoFps by remember { mutableStateOf(0.0) }
+    var selectedVideoPanelMask by rememberSaveable(usePhoneCamera) {
+        mutableIntStateOf(defaultAssistanceVideoPanelMask(usePhoneCamera))
+    }
     var foregroundGeneration by remember { mutableIntStateOf(0) }
     var reconnectGeneration by remember { mutableIntStateOf(0) }
     var bleStartRequested by remember { mutableStateOf(false) }
@@ -427,6 +433,16 @@ internal fun DepthCameraScreen(
                     showGrid = settings.showGrid,
                     signalingServer = activeSignalingServer.takeUnless { usePhoneCamera },
                     remoteVideoFps = remoteVideoFps,
+                    selectedPanelMask = selectedVideoPanelMask,
+                    onPanelToggled = { panel ->
+                        selectedVideoPanelMask = toggleAssistanceVideoPanel(
+                            currentMask = selectedVideoPanelMask,
+                            panel = panel,
+                            availableMask = availableAssistanceVideoPanelMask(
+                                rawVideoAvailable = activeSignalingServer != null && !usePhoneCamera,
+                            ),
+                        )
+                    },
                     onFrameDisplayed = viewModel::reportUiFrameDisplayed,
                 )
             }
@@ -557,6 +573,8 @@ private fun RunningCameraPanel(
     showGrid: Boolean,
     signalingServer: LocalSignalingServer?,
     remoteVideoFps: Double,
+    selectedPanelMask: Int,
+    onPanelToggled: (AssistanceVideoPanel) -> Unit,
     onFrameDisplayed: (Long) -> Unit,
 ) {
     LaunchedEffect(state.performanceFrameSequence) {
@@ -565,24 +583,79 @@ private fun RunningCameraPanel(
     Column(
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        if (signalingServer != null) {
+        VideoPanelSelector(
+            selectedPanelMask = selectedPanelMask,
+            rawVideoAvailable = signalingServer != null,
+            onPanelToggled = onPanelToggled,
+        )
+        if (
+            signalingServer != null &&
+            selectedPanelMask and AssistanceVideoPanel.RAW_VIDEO.mask != 0
+        ) {
             RawVideoPanel(
                 signalingServer = signalingServer,
                 remoteVideoFps = remoteVideoFps,
             )
         }
-        CameraImagePanel(
-            label = "深度图",
-            image = state.image,
-            showGrid = showGrid,
-            badge = String.format(Locale.US, "模型 %.1f FPS", state.fps),
-        )
-        CameraImagePanel(
-            label = "障碍分类",
-            image = state.classificationImage,
-            showGrid = showGrid,
-            badge = "${state.activeObstacleCells} 个障碍区域",
-        )
+        if (selectedPanelMask and AssistanceVideoPanel.DEPTH.mask != 0) {
+            CameraImagePanel(
+                label = "深度图",
+                image = state.image,
+                showGrid = showGrid,
+                badge = String.format(Locale.US, "模型 %.1f FPS", state.fps),
+            )
+        }
+        if (selectedPanelMask and AssistanceVideoPanel.OBSTACLE.mask != 0) {
+            CameraImagePanel(
+                label = "障碍分类",
+                image = state.classificationImage,
+                showGrid = showGrid,
+                badge = "${state.activeObstacleCells} 个障碍区域",
+            )
+        }
+    }
+}
+
+@Composable
+private fun VideoPanelSelector(
+    selectedPanelMask: Int,
+    rawVideoAvailable: Boolean,
+    onPanelToggled: (AssistanceVideoPanel) -> Unit,
+) {
+    val availableMask = availableAssistanceVideoPanelMask(rawVideoAvailable)
+    val selectedCount = Integer.bitCount(selectedPanelMask and availableMask)
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        AssistanceVideoPanel.entries.forEach { panel ->
+            val selected = selectedPanelMask and panel.mask != 0
+            val available = availableMask and panel.mask != 0
+            val enabled = available && when {
+                selected -> true
+                else -> selectedCount < MAX_VISIBLE_VIDEO_PANELS
+            }
+            FilterChip(
+                selected = selected,
+                onClick = { onPanelToggled(panel) },
+                enabled = enabled,
+                label = { Text(panel.selectorLabel, maxLines = 1) },
+                leadingIcon = if (selected) {
+                    {
+                        Icon(
+                            imageVector = Icons.Default.Check,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
+                } else {
+                    null
+                },
+                modifier = Modifier
+                    .weight(1f)
+                    .height(40.dp),
+            )
+        }
     }
 }
 
@@ -704,10 +777,48 @@ private fun CameraImagePanel(
 
 private const val ASSISTANCE_GRID_SIZE = 64
 private const val RAW_VIDEO_ASPECT_RATIO = 9f / 16f
+private const val MAX_VISIBLE_VIDEO_PANELS = 2
 private const val SIGNALING_PORT = 8888
 private const val BLE_RECONNECT_DELAY_MS = 750L
 private const val ASSISTANCE_STOP_TIMEOUT_MS = 5_000L
 private const val PHONE_SESSION_TAG = "PhoneSession"
+
+internal enum class AssistanceVideoPanel(
+    val mask: Int,
+    val selectorLabel: String,
+) {
+    RAW_VIDEO(1 shl 0, "原画"),
+    DEPTH(1 shl 1, "深度"),
+    OBSTACLE(1 shl 2, "障碍"),
+}
+
+internal fun defaultAssistanceVideoPanelMask(usePhoneCamera: Boolean): Int =
+    if (usePhoneCamera) {
+        AssistanceVideoPanel.DEPTH.mask or AssistanceVideoPanel.OBSTACLE.mask
+    } else {
+        AssistanceVideoPanel.RAW_VIDEO.mask or AssistanceVideoPanel.DEPTH.mask
+    }
+
+internal fun availableAssistanceVideoPanelMask(rawVideoAvailable: Boolean): Int =
+    AssistanceVideoPanel.DEPTH.mask or
+        AssistanceVideoPanel.OBSTACLE.mask or
+        if (rawVideoAvailable) AssistanceVideoPanel.RAW_VIDEO.mask else 0
+
+internal fun toggleAssistanceVideoPanel(
+    currentMask: Int,
+    panel: AssistanceVideoPanel,
+    availableMask: Int,
+): Int {
+    val normalizedMask = currentMask and availableMask
+    if (panel.mask and availableMask == 0) return normalizedMask
+    val selected = normalizedMask and panel.mask != 0
+    val selectedCount = Integer.bitCount(normalizedMask)
+    return when {
+        selected -> normalizedMask and panel.mask.inv()
+        !selected && selectedCount < MAX_VISIBLE_VIDEO_PANELS -> normalizedMask or panel.mask
+        else -> normalizedMask
+    }
+}
 
 internal fun shouldBeginGlassesSession(
     usePhoneCamera: Boolean,
