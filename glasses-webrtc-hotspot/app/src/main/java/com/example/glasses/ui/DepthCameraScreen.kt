@@ -684,7 +684,7 @@ private fun RawVideoPanel(
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .aspectRatio(RAW_VIDEO_ASPECT_RATIO)
+            .aspectRatio(1f)
             .clip(RoundedCornerShape(8.dp))
             .background(Color.Black),
     ) {
@@ -776,7 +776,6 @@ private fun CameraImagePanel(
 }
 
 private const val ASSISTANCE_GRID_SIZE = 64
-private const val RAW_VIDEO_ASPECT_RATIO = 9f / 16f
 private const val MAX_VISIBLE_VIDEO_PANELS = 2
 private const val SIGNALING_PORT = 8888
 private const val BLE_RECONNECT_DELAY_MS = 750L
